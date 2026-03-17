@@ -1,248 +1,329 @@
-const express   = require('express');
-const puppeteer = require('puppeteer-core');
+// proxy/vidsrc-proxy.js
+// Deploy to Cloudflare Workers or Node.js server
 
-const app  = express();
-const PORT = process.env.PORT || 3000;
+const BASE_URL = 'https://v2.vidsrc.me';
+const ALTERNATIVE_API = 'https://2embed.stream';
 
-const BROWSERLESS_KEY = process.env.BROWSERLESS_KEY;
-
-// ← correct domain first
-const MIRRORS = [
-  'https://vidsrc-embed.ru',
-  'https://vidsrc.me',
-  'https://vidsrc.in',
-];
-
-app.use((req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  next();
-});
-
-app.get('/health', (_, res) => res.json({ ok: true }));
-
-app.get('/sources', async (req, res) => {
-  const { imdb, season, episode } = req.query;
-  if (!imdb) return res.status(400).json({ error: 'imdb required' });
-  if (!BROWSERLESS_KEY) {
-    return res.status(500).json({ error: 'BROWSERLESS_KEY not set' });
-  }
-
-  console.log(`[proxy] imdb=${imdb} season=${season} episode=${episode}`);
-
-  let browser;
-  const sources   = [];
-  const subtitles = [];
-
-  try {
-    browser = await puppeteer.connect({
-      browserWSEndpoint:
-        `wss://chrome.browserless.io?token=${BROWSERLESS_KEY}`,
-    });
-
-    const page = await browser.newPage();
-
-    await page.setUserAgent(
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
-      'AppleWebKit/537.36 (KHTML, like Gecko) ' +
-      'Chrome/120.0.0.0 Safari/537.36'
-    );
-
-    // ── CDP: capture ALL requests including nested iframes ────────
-    const cdp = await page.target().createCDPSession();
-    await cdp.send('Network.enable');
-    await cdp.send('Network.setRequestInterception', {
-      patterns: [{ urlPattern: '*' }],
-    });
-
-    cdp.on('Network.requestIntercepted', async ({
-      interceptionId, request
-    }) => {
-      const url  = request.url;
-      const hdrs = request.headers || {};
-
-      if (url.includes('.m3u8')) {
-        if (!sources.find(s => s.url === url)) {
-          console.log(`[CDP] m3u8: ${url.slice(0, 100)}`);
-          sources.push({
-            url,
-            quality:  'auto',
-            mimeType: 'application/x-mpegURL',
-            headers: {
-              'Referer':    hdrs['Referer']    || hdrs['referer']    || 'https://vidsrc-embed.ru/',
-              'User-Agent': hdrs['User-Agent'] || hdrs['user-agent'] || '',
-              'Origin':     hdrs['Origin']     || hdrs['origin']     || '',
-            },
-            subtitles,
-          });
-        }
-      }
-
-      if (url.match(/\.mp4(\?|$)/i)) {
-        if (!sources.find(s => s.url === url)) {
-          console.log(`[CDP] mp4: ${url.slice(0, 100)}`);
-          sources.push({
-            url,
-            quality:  'auto',
-            mimeType: 'video/mp4',
-            headers: {
-              'Referer': hdrs['referer'] || 'https://vidsrc-embed.ru/',
-            },
-            subtitles,
-          });
-        }
-      }
-
-      if (url.includes('.vtt')) {
-        if (!subtitles.find(s => s.url === url)) {
-          subtitles.push({ url, language: 'en', label: 'Subtitle' });
-        }
-      }
-
-      try {
-        await cdp.send('Network.continueInterceptedRequest', {
-          interceptionId,
-        });
-      } catch (_) {}
-    });
-
-    // ── Capture JSON source API responses ─────────────────────────
-    cdp.on('Network.responseReceived', async ({
-      requestId, response
-    }) => {
-      const url         = response.url;
-      const contentType = response.headers['content-type'] || '';
-
-      if (
-        contentType.includes('json') &&
-        (url.includes('/source') || url.includes('/api/'))
-      ) {
-        try {
-          const body = await cdp.send('Network.getResponseBody', {
-            requestId,
-          });
-          const json = JSON.parse(body.body);
-          const list = json?.source || json?.sources || json?.data || [];
-          if (Array.isArray(list)) {
-            list.forEach(s => {
-              const streamUrl = s.file || s.url || s.src;
-              if (streamUrl && !sources.find(x => x.url === streamUrl)) {
-                console.log(`[CDP] JSON source: ${streamUrl.slice(0, 80)}`);
-                sources.push({
-                  url:      streamUrl,
-                  quality:  s.label || 'auto',
-                  mimeType: streamUrl.includes('.m3u8')
-                    ? 'application/x-mpegURL' : 'video/mp4',
-                  headers:  {
-                    'Referer': 'https://vidsrc-embed.ru/',
-                  },
-                  subtitles: [],
-                });
-              }
-            });
-          }
-        } catch (_) {}
-      }
-    });
-
-    // ── Try each mirror ───────────────────────────────────────────
-    let loaded = false;
-    for (const mirror of MIRRORS) {
-      try {
-        // Use clean path format: /embed/movie/{imdbId}
-        const embedUrl = season
-          ? `${mirror}/embed/tv/${imdb}?season=${season}&episode=${episode}`
-          : `${mirror}/embed/movie/${imdb}`;
-
-        console.log(`[proxy] Loading: ${embedUrl}`);
-
-        await page.goto(embedUrl, {
-          waitUntil: 'domcontentloaded',
-          timeout:   30000,
-        });
-        loaded = true;
-        console.log(`[proxy] Loaded from ${mirror}`);
-        break;
-      } catch (e) {
-        console.log(`[proxy] ${mirror} failed: ${e.message}`);
-      }
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const path = url.pathname;
+    
+    // CORS headers
+    const corsHeaders = {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    };
+    
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { headers: corsHeaders });
     }
 
-    if (!loaded) {
-      return res.status(502).json({
-        error: 'All mirrors failed', sources: [],
-      });
-    }
-
-    // ── Click play button if present ──────────────────────────────
     try {
-      await page.waitForSelector(
-        '.play-btn, button.play, [aria-label="Play"], '  +
-        '.jw-icon-playback, .plyr__control--overlaid',
-        { timeout: 5000 }
-      );
-      await page.click(
-        '.play-btn, button.play, [aria-label="Play"], ' +
-        '.jw-icon-playback, .plyr__control--overlaid'
-      );
-      console.log('[proxy] Clicked play');
-    } catch (_) {
-      // No play button — autoplay may handle it
-      console.log('[proxy] No play button, waiting for autoplay...');
-    }
-
-    // ── Poll up to 20s for stream ─────────────────────────────────
-    let waited = 0;
-    while (sources.length === 0 && waited < 20000) {
-      await new Promise(r => setTimeout(r, 1000));
-      waited += 1000;
-      console.log(
-        `[proxy] ${waited / 1000}s | sources: ${sources.length}`
-      );
-    }
-
-    // ── Last resort: performance API ──────────────────────────────
-    if (sources.length === 0) {
-      console.log('[proxy] Trying performance API fallback...');
-      const perfUrls = await page.evaluate(() =>
-        performance
-          .getEntriesByType('resource')
-          .map(r => r.name)
-          .filter(u => u.includes('.m3u8') || u.includes('.mp4'))
-      );
-      console.log('[proxy] perf URLs:', perfUrls);
-      perfUrls.forEach(url => {
-        if (!sources.find(s => s.url === url)) {
-          sources.push({
-            url,
-            quality:  'auto',
-            mimeType: url.includes('m3u8')
-              ? 'application/x-mpegURL' : 'video/mp4',
-            headers:  { 'Referer': 'https://vidsrc-embed.ru/' },
-            subtitles: [],
-          });
+      // Endpoint: /extract?tmdbId=123&type=movie
+      if (path === '/extract') {
+        const tmdbId = url.searchParams.get('tmdbId');
+        const type = url.searchParams.get('type'); // 'movie' or 'tv'
+        const season = url.searchParams.get('season');
+        const episode = url.searchParams.get('episode');
+        
+        if (!tmdbId || !type) {
+          return jsonResponse({ error: 'Missing required parameters' }, 400, corsHeaders);
         }
-      });
+        
+        const streams = await extractStreams(tmdbId, type, season, episode);
+        return jsonResponse(streams, 200, corsHeaders);
+      }
+      
+      // Endpoint: /proxy-stream?url=encoded_m3u8_url
+      if (path === '/proxy-stream') {
+        const targetUrl = decodeURIComponent(url.searchParams.get('url') || '');
+        if (!targetUrl) {
+          return jsonResponse({ error: 'Missing URL parameter' }, 400, corsHeaders);
+        }
+        
+        return proxyStream(targetUrl, request.headers.get('User-Agent'), corsHeaders);
+      }
+      
+      // Health check
+      if (path === '/health') {
+        return jsonResponse({ status: 'ok', timestamp: new Date().toISOString() }, 200, corsHeaders);
+      }
+      
+      return jsonResponse({ error: 'Not found' }, 404, corsHeaders);
+      
+    } catch (error) {
+      console.error('Proxy error:', error);
+      return jsonResponse({ 
+        error: 'Internal server error',
+        message: error.message 
+      }, 500, corsHeaders);
     }
-
-    console.log(`[proxy] Final: ${sources.length} source(s)`);
-    res.json({ sources });
-
-  } catch (err) {
-    console.error('[proxy] Fatal:', err.message);
-    res.status(500).json({ error: err.message, sources: [] });
-  } finally {
-    if (browser) await browser.disconnect();
   }
-});
+};
 
-// Keep Render awake
-if (process.env.RENDER_EXTERNAL_URL) {
-  setInterval(() => {
-    require('https').get(
-      process.env.RENDER_EXTERNAL_URL + '/health', () => {}
-    );
-  }, 840000);
+async function extractStreams(tmdbId, type, season, episode) {
+  // Strategy 1: Try 2embed.stream API (no captcha, direct M3U8)
+  try {
+    const embedUrl = type === 'movie' 
+      ? `${ALTERNATIVE_API}/embed/${tmdbId}`
+      : `${ALTERNATIVE_API}/embed/${tmdbId}/${season}/${episode}`;
+    
+    // Fetch the embed page
+    const response = await fetch(embedUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Referer': 'https://2embed.stream/',
+      },
+    });
+    
+    const html = await response.text();
+    
+    // Extract M3U8 URLs using regex patterns
+    const streams = parseStreamsFromHtml(html, tmdbId, type, season, episode);
+    
+    if (streams.length > 0) {
+      return {
+        success: true,
+        source: '2embed',
+        tmdbId,
+        type,
+        season,
+        episode,
+        streams: streams.map(s => ({
+          ...s,
+          // Create proxied URL to bypass CORS/referer restrictions
+          proxiedUrl: `/proxy-stream?url=${encodeURIComponent(s.url)}`
+        })),
+        timestamp: new Date().toISOString(),
+      };
+    }
+  } catch (error) {
+    console.error('2embed extraction failed:', error);
+  }
+  
+  // Strategy 2: Try VidSrc directly (iframe extraction)
+  try {
+    const streams = await extractFromVidSrc(tmdbId, type, season, episode);
+    if (streams.length > 0) {
+      return {
+        success: true,
+        source: 'vidsrc',
+        tmdbId,
+        type,
+        season,
+        episode,
+        streams,
+        timestamp: new Date().toISOString(),
+      };
+    }
+  } catch (error) {
+    console.error('VidSrc extraction failed:', error);
+  }
+  
+  return {
+    success: false,
+    error: 'No streams found',
+    tmdbId,
+    type,
+  };
 }
 
-app.listen(PORT, () =>
-  console.log(`[proxy] Running on port ${PORT}`));
+function parseStreamsFromHtml(html, tmdbId, type, season, episode) {
+  const streams = [];
+  
+  // Pattern 1: Direct M3U8 URLs in JavaScript
+  const m3u8Regex = /(https?:\/\/[^"'\s]+\.m3u8[^"'\s]*)/g;
+  const m3u8Matches = [...html.matchAll(m3u8Regex)];
+  
+  // Pattern 2: JSON-encoded sources
+  const sourcesRegex = /sources:\s*(\[[^\]]+\])/i;
+  const sourcesMatch = html.match(sourcesRegex);
+  
+  // Pattern 3: Data attributes
+  const dataRegex = /data-url="([^"]+)"/g;
+  const dataMatches = [...html.matchAll(dataRegex)];
+  
+  // Process M3U8 URLs
+  m3u8Matches.forEach((match, index) => {
+    const url = match[1];
+    // Determine quality from URL or default to auto
+    const quality = extractQualityFromUrl(url) || (index === 0 ? 'auto' : `variant-${index}`);
+    
+    streams.push({
+      url: url,
+      quality: quality,
+      type: 'hls',
+      label: quality === 'auto' ? 'Auto' : quality,
+    });
+  });
+  
+  // Process JSON sources if found
+  if (sourcesMatch) {
+    try {
+      const sources = JSON.parse(sourcesMatch[1]);
+      sources.forEach(source => {
+        if (source.file && !streams.find(s => s.url === source.file)) {
+          streams.push({
+            url: source.file,
+            quality: source.label || extractQualityFromUrl(source.file) || 'auto',
+            type: source.type || 'hls',
+            label: source.label || 'Auto',
+          });
+        }
+      });
+    } catch (e) {
+      console.error('Failed to parse sources JSON:', e);
+    }
+  }
+  
+  return streams;
+}
+
+function extractQualityFromUrl(url) {
+  const patterns = [
+    /(\d{3,4})p/i,
+    /_(\d{3,4})_/,
+    /\/(\d{3,4})\//,
+  ];
+  
+  for (const pattern of patterns) {
+    const match = url.match(pattern);
+    if (match) {
+      return `${match[1]}p`;
+    }
+  }
+  
+  if (url.includes('master')) return 'auto';
+  if (url.includes('1080')) return '1080p';
+  if (url.includes('720')) return '720p';
+  if (url.includes('480')) return '480p';
+  
+  return null;
+}
+
+async function extractFromVidSrc(tmdbId, type, season, episode) {
+  // VidSrc requires more complex extraction - often needs puppeteer or similar
+  // This is a simplified version that attempts direct API access
+  
+  const streams = [];
+  
+  // Try the .me API endpoints
+  const endpoints = [
+    type === 'movie' 
+      ? `https://v2.vidsrc.me/embed/${tmdbId}`
+      : `https://v2.vidsrc.me/embed/${tmdbId}/${season}-${episode}`,
+  ];
+  
+  for (const endpoint of endpoints) {
+    try {
+      const response = await fetch(endpoint, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+          'Referer': 'https://v2.vidsrc.me/',
+        },
+      });
+      
+      const html = await response.text();
+      const extracted = parseStreamsFromHtml(html, tmdbId, type, season, episode);
+      streams.push(...extracted);
+    } catch (error) {
+      console.error(`Failed to extract from ${endpoint}:`, error);
+    }
+  }
+  
+  return streams;
+}
+
+async function proxyStream(targetUrl, userAgent, corsHeaders) {
+  // Proxy the M3U8 or TS segments to handle CORS and referer restrictions
+  
+  const headers = {
+    'User-Agent': userAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    'Referer': 'https://2embed.stream/',
+    'Origin': 'https://2embed.stream',
+  };
+  
+  try {
+    const response = await fetch(targetUrl, { headers });
+    
+    // If it's an M3U8 file, rewrite URLs to point to our proxy
+    const contentType = response.headers.get('content-type') || '';
+    
+    if (contentType.includes('application/vnd.apple.mpegurl') || 
+        contentType.includes('application/x-mpegURL') ||
+        targetUrl.endsWith('.m3u8')) {
+      
+      let body = await response.text();
+      
+      // Rewrite relative URLs to absolute and proxy them
+      body = rewriteM3u8Urls(body, targetUrl);
+      
+      return new Response(body, {
+        headers: {
+          ...corsHeaders,
+          'Content-Type': 'application/vnd.apple.mpegurl',
+          'Cache-Control': 'public, max-age=60',
+        },
+      });
+    }
+    
+    // For video segments, just proxy through
+    return new Response(response.body, {
+      status: response.status,
+      headers: {
+        ...corsHeaders,
+        'Content-Type': contentType,
+        'Cache-Control': 'public, max-age=3600',
+      },
+    });
+    
+  } catch (error) {
+    return jsonResponse({ error: 'Failed to proxy stream' }, 502, corsHeaders);
+  }
+}
+
+function rewriteM3u8Urls(m3u8Content, baseUrl) {
+  const baseUrlObj = new URL(baseUrl);
+  const basePath = baseUrlObj.href.substring(0, baseUrlObj.href.lastIndexOf('/') + 1);
+  
+  let lines = m3u8Content.split('\n');
+  
+  lines = lines.map(line => {
+    line = line.trim();
+    
+    // Skip comments and empty lines
+    if (!line || line.startsWith('#')) {
+      // Handle EXT-X-KEY URI rewriting
+      if (line.includes('URI="')) {
+        return line.replace(/URI="([^"]+)"/, (match, uri) => {
+          const absoluteUrl = new URL(uri, basePath).href;
+          return `URI="/proxy-stream?url=${encodeURIComponent(absoluteUrl)}"`;
+        });
+      }
+      return line;
+    }
+    
+    // Rewrite segment URLs
+    if (line.startsWith('http')) {
+      return `/proxy-stream?url=${encodeURIComponent(line)}`;
+    } else {
+      // Relative URL
+      const absoluteUrl = new URL(line, basePath).href;
+      return `/proxy-stream?url=${encodeURIComponent(absoluteUrl)}`;
+    }
+  });
+  
+  return lines.join('\n');
+}
+
+function jsonResponse(data, status = 200, corsHeaders = {}) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      ...corsHeaders,
+      'Content-Type': 'application/json',
+    },
+  });
+}

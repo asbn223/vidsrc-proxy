@@ -28,7 +28,11 @@ app.get('/sources', async (req, res) => {
   try {
     browser = await puppeteer.launch({
       headless: 'new',
-      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+      executablePath:
+        process.env.CHROME_BIN ||
+        '/usr/bin/google-chrome-stable' ||
+        '/usr/bin/chromium-browser' ||
+        '/usr/bin/chromium',
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',

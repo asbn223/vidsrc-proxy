@@ -1,31 +1,15 @@
-const express = require('express');
-const fetch   = require('node-fetch');
-const cheerio = require('cheerio');
+const express   = require('express');
+const puppeteer = require('puppeteer-core');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
-// Try mirrors in order if one fails
+const BROWSERLESS_KEY = process.env.BROWSERLESS_KEY;
 const MIRRORS = [
   'https://vidsrc.me',
   'https://vidsrc.in',
   'https://vidsrc.pm',
 ];
-
-const HEADERS = {
-  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-    + 'AppleWebKit/537.36 (KHTML, like Gecko) '
-    + 'Chrome/120.0.0.0 Safari/537.36',
-  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-  'Accept-Language': 'en-US,en;q=0.5',
-  'Referer': 'https://vidsrc.me/',
-};
-
-const JSON_HEADERS = {
-  ...HEADERS,
-  'Accept': 'application/json, text/plain, */*',
-  'X-Requested-With': 'XMLHttpRequest',
-};
 
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -37,225 +21,169 @@ app.get('/health', (_, res) => res.json({ ok: true }));
 app.get('/sources', async (req, res) => {
   const { imdb, season, episode } = req.query;
   if (!imdb) return res.status(400).json({ error: 'imdb required' });
-
-  console.log(`[proxy] Request: imdb=${imdb} season=${season} episode=${episode}`);
-
-  // ── Step 1: Try every mirror until one works ──────────────────
-  let html = null;
-  let baseUrl = MIRRORS[0];
-
-  for (const mirror of MIRRORS) {
-    try {
-      const url = season
-        ? `${mirror}/embed/tv?imdb=${imdb}&season=${season}&episode=${episode}`
-        : `${mirror}/embed/movie?imdb=${imdb}`;
-
-      console.log(`[proxy] Trying mirror: ${url}`);
-      const r = await fetch(url, {
-        headers: { ...HEADERS, 'Referer': `${mirror}/` },
-        timeout: 15000,
-      });
-
-      if (r.ok) {
-        html    = await r.text();
-        baseUrl = mirror;
-        console.log(`[proxy] Got HTML from ${mirror} (${html.length} bytes)`);
-        break;
-      }
-    } catch (e) {
-      console.log(`[proxy] Mirror ${mirror} failed: ${e.message}`);
-    }
+  if (!BROWSERLESS_KEY) {
+    return res.status(500).json({ error: 'BROWSERLESS_KEY env var not set' });
   }
 
-  if (!html) {
-    return res.status(502).json({
-      error: 'All mirrors failed. VidSrc may be down.',
-      sources: [],
+  console.log(`[proxy] imdb=${imdb} season=${season} episode=${episode}`);
+
+  const sources   = [];
+  const subtitles = [];
+  let   browser;
+
+  try {
+    // ── Connect to remote Chrome on Browserless ───────────────────
+    browser = await puppeteer.connect({
+      browserWSEndpoint:
+        `wss://chrome.browserless.io?token=${BROWSERLESS_KEY}`,
     });
-  }
 
-  const sources = [];
-  const $ = cheerio.load(html);
+    const page = await browser.newPage();
 
-  // ── Step 2: Look for .m3u8 / .mp4 URLs directly in the HTML ──
-  const allText = html;
+    // ── Intercept all network requests ───────────────────────────
+    await page.setRequestInterception(true);
 
-  const m3u8Regex = /https?:\/\/[^\s"'<>\\]+\.m3u8(?:[^\s"'<>\\]*)?/g;
-  const mp4Regex  = /https?:\/\/[^\s"'<>\\]+\.mp4(?:[^\s"'<>\\]*)?/g;
+    page.on('request', r => {
+      const url  = r.url();
+      const type = r.resourceType();
 
-  (allText.match(m3u8Regex) || []).forEach(url => {
-    const clean = url.replace(/\\u0026/g, '&').replace(/\\/g, '');
-    if (!sources.find(s => s.url === clean)) {
-      sources.push({
-        url:      clean,
-        quality:  'auto',
-        mimeType: 'application/x-mpegURL',
-        headers:  { 'Referer': `${baseUrl}/` },
-        subtitles: [],
-      });
-    }
-  });
-
-  (allText.match(mp4Regex) || []).forEach(url => {
-    const clean = url.replace(/\\u0026/g, '&').replace(/\\/g, '');
-    if (!sources.find(s => s.url === clean)) {
-      sources.push({
-        url:      clean,
-        quality:  'auto',
-        mimeType: 'video/mp4',
-        headers:  { 'Referer': `${baseUrl}/` },
-        subtitles: [],
-      });
-    }
-  });
-
-  console.log(`[proxy] Found in HTML: ${sources.length} direct URL(s)`);
-
-  // ── Step 3: Extract real data-id (only from data attributes) ──
-  // Never use script src — that caused the previous bug
-  const dataId = $('[data-id]').first().attr('data-id')
-    || $('[data-hash]').first().attr('data-hash')
-    || $('[data-video-id]').first().attr('data-video-id')
-    || null;
-
-  console.log(`[proxy] data-id found: ${dataId}`);
-
-  // ── Step 4: Extract media hash from script content ────────────
-  let mediaHash = null;
-  $('script').each((_, el) => {
-    const text = $(el).html() || '';
-    // Look for patterns like: var id = "abc123" or mediaId: "abc123"
-    const patterns = [
-      /(?:var\s+)?(?:id|mediaId|source_id|video_id)\s*[=:]\s*['"]([a-zA-Z0-9]+)['"]/,
-      /\/api\/source\/([a-zA-Z0-9]+)/,
-      /\/v\/([a-zA-Z0-9]+)/,
-    ];
-    for (const p of patterns) {
-      const m = text.match(p);
-      if (m && m[1] && m[1].length > 4 && !m[1].includes('.')) {
-        mediaHash = m[1];
-        break;
+      // Block heavy assets to speed up load
+      if (['image', 'font', 'stylesheet'].includes(type)) {
+        return r.abort();
       }
-    }
-  });
 
-  console.log(`[proxy] mediaHash found: ${mediaHash}`);
-
-  // ── Step 5: Try VidSrc internal API endpoints ─────────────────
-  const hashToTry = dataId || mediaHash;
-
-  if (hashToTry && sources.length === 0) {
-    const apiEndpoints = [
-      `${baseUrl}/api/source/${hashToTry}`,
-      `${baseUrl}/ajax/embed/source/${hashToTry}`,
-      `${baseUrl}/ajax/source/${hashToTry}`,
-    ];
-
-    for (const apiUrl of apiEndpoints) {
-      try {
-        console.log(`[proxy] Trying API: ${apiUrl}`);
-        const apiRes = await fetch(apiUrl, {
-          headers: JSON_HEADERS,
-          timeout: 10000,
-        });
-
-        // Check content-type BEFORE trying to parse as JSON
-        const contentType = apiRes.headers.get('content-type') || '';
-        if (!contentType.includes('json')) {
-          console.log(`[proxy] Skipping ${apiUrl} — not JSON (${contentType})`);
-          continue;
-        }
-
-        const data = await apiRes.json();
-        console.log(`[proxy] API response:`, JSON.stringify(data).slice(0, 200));
-
-        const list = data?.source || data?.sources || data?.data || [];
-        if (Array.isArray(list)) {
-          list.forEach(s => {
-            const url = s.file || s.url || s.src;
-            if (url && !sources.find(x => x.url === url)) {
-              sources.push({
-                url,
-                quality:  s.label || s.quality || 'auto',
-                mimeType: url.includes('.m3u8')
-                  ? 'application/x-mpegURL' : 'video/mp4',
-                headers:  { 'Referer': `${baseUrl}/` },
-                subtitles: (s.tracks || s.subtitles || [])
-                  .filter(t => t.kind === 'captions' || t.kind === 'subtitles')
-                  .map(t => ({
-                    url:      t.file || t.url,
-                    label:    t.label || 'Subtitle',
-                    language: t.language || 'en',
-                  })),
-              });
-            }
+      // Capture .m3u8 stream URLs
+      if (url.includes('.m3u8')) {
+        const hdrs = r.headers();
+        if (!sources.find(s => s.url === url)) {
+          console.log(`[proxy] Captured m3u8: ${url.slice(0, 80)}...`);
+          sources.push({
+            url,
+            quality:  'auto',
+            mimeType: 'application/x-mpegURL',
+            headers: {
+              'Referer':    hdrs['referer']    || 'https://vidsrc.me/',
+              'User-Agent': hdrs['user-agent'] || '',
+              'Origin':     hdrs['origin']     || 'https://vidsrc.me',
+            },
+            subtitles,
           });
         }
-
-        if (sources.length > 0) break; // stop trying endpoints
-
-      } catch (e) {
-        console.log(`[proxy] API ${apiUrl} error: ${e.message}`);
       }
-    }
-  }
 
-  // ── Step 6: Try iframe src as a last resort ───────────────────
-  if (sources.length === 0) {
-    const iframeSrc = $('iframe[src]').first().attr('src')
-      || $('iframe[data-src]').first().attr('data-src');
+      // Capture .mp4 stream URLs
+      if (url.match(/\.mp4(\?|$)/)) {
+        if (!sources.find(s => s.url === url)) {
+          console.log(`[proxy] Captured mp4: ${url.slice(0, 80)}...`);
+          sources.push({
+            url,
+            quality:  'auto',
+            mimeType: 'video/mp4',
+            headers: {
+              'Referer': r.headers()['referer'] || 'https://vidsrc.me/',
+            },
+            subtitles,
+          });
+        }
+      }
 
-    if (iframeSrc) {
-      const fullSrc = iframeSrc.startsWith('http')
-        ? iframeSrc
-        : `${baseUrl}${iframeSrc}`;
-      console.log(`[proxy] Found iframe: ${fullSrc}`);
+      // Capture subtitle files
+      if (url.includes('.vtt')) {
+        if (!subtitles.find(s => s.url === url)) {
+          subtitles.push({ url, language: 'en', label: 'Subtitle' });
+        }
+      }
 
-      try {
-        const iframeRes = await fetch(fullSrc, {
-          headers: { ...HEADERS, 'Referer': `${baseUrl}/` },
-          timeout: 15000,
-        });
-        const iframeHtml = await iframeRes.text();
+      r.continue();
+    });
 
-        (iframeHtml.match(m3u8Regex) || []).forEach(url => {
-          const clean = url.replace(/\\u0026/g, '&');
-          if (!sources.find(s => s.url === clean)) {
-            sources.push({
-              url:      clean,
-              quality:  'auto',
-              mimeType: 'application/x-mpegURL',
-              headers:  { 'Referer': fullSrc },
-              subtitles: [],
+    // ── Also intercept responses to catch JSON source APIs ────────
+    page.on('response', async response => {
+      const url         = response.url();
+      const contentType = response.headers()['content-type'] || '';
+
+      if (
+        contentType.includes('json') &&
+        (url.includes('/source') ||
+         url.includes('/api/')   ||
+         url.includes('/embed/'))
+      ) {
+        try {
+          const json = await response.json();
+          console.log(`[proxy] JSON response from ${url.slice(0, 60)}`);
+
+          const list = json?.source || json?.sources || json?.data || [];
+          if (Array.isArray(list)) {
+            list.forEach(s => {
+              const streamUrl = s.file || s.url || s.src;
+              if (streamUrl && !sources.find(x => x.url === streamUrl)) {
+                sources.push({
+                  url:      streamUrl,
+                  quality:  s.label || 'auto',
+                  mimeType: streamUrl.includes('.m3u8')
+                    ? 'application/x-mpegURL' : 'video/mp4',
+                  headers:  { 'Referer': 'https://vidsrc.me/' },
+                  subtitles: [],
+                });
+              }
             });
           }
-        });
-      } catch (e) {
-        console.log(`[proxy] iframe fetch failed: ${e.message}`);
-      }
-    }
-  }
-
-  console.log(`[proxy] Final source count: ${sources.length}`);
-
-  if (sources.length === 0) {
-    return res.json({
-      sources: [],
-      debug: {
-        mirror:    baseUrl,
-        dataId:    dataId   || 'not found',
-        mediaHash: mediaHash || 'not found',
-        htmlSize:  html.length,
-        note: 'VidSrc uses heavy JS rendering. Sources may only be '
-          + 'extractable with a real browser (Browserless option).',
+        } catch (_) { /* not parseable JSON, skip */ }
       }
     });
-  }
 
-  res.json({ sources });
+    // ── Try each mirror until one works ──────────────────────────
+    let loaded = false;
+    for (const mirror of MIRRORS) {
+      try {
+        const embedUrl = season
+          ? `${mirror}/embed/tv?imdb=${imdb}&season=${season}&episode=${episode}`
+          : `${mirror}/embed/movie?imdb=${imdb}`;
+
+        console.log(`[proxy] Loading: ${embedUrl}`);
+
+        await page.goto(embedUrl, {
+          waitUntil: 'networkidle2',
+          timeout:   30000,
+        });
+        loaded = true;
+        console.log(`[proxy] Page loaded from ${mirror}`);
+        break;
+      } catch (e) {
+        console.log(`[proxy] Mirror ${mirror} failed: ${e.message}`);
+      }
+    }
+
+    if (!loaded) {
+      return res.status(502).json({
+        error: 'All VidSrc mirrors failed to load',
+        sources: [],
+      });
+    }
+
+    // ── Wait for JS player to fire the stream request ─────────────
+    // Poll every second for up to 15 seconds
+    let waited = 0;
+    while (sources.length === 0 && waited < 15000) {
+      await new Promise(r => setTimeout(r, 1000));
+      waited += 1000;
+      console.log(`[proxy] Waiting for stream... ${waited / 1000}s`);
+    }
+
+    console.log(`[proxy] Done. Found ${sources.length} source(s)`);
+    res.json({ sources });
+
+  } catch (err) {
+    console.error('[proxy] Fatal error:', err.message);
+    res.status(500).json({ error: err.message, sources: [] });
+  } finally {
+    if (browser) {
+      await browser.disconnect(); // disconnect, NOT close (it's remote)
+    }
+  }
 });
 
-// Keep Render free tier awake
+// Keep Render free tier awake (pings every 14 min)
 if (process.env.RENDER_EXTERNAL_URL) {
   setInterval(() => {
     require('https').get(

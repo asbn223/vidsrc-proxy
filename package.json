@@ -2,13 +2,11 @@
   "name": "vidsrc-stream-proxy",
   "version": "1.0.0",
   "scripts": {
-    "start": "node server.js",
-    "postinstall": "npx playwright install chromium"
+    "start": "node server.js"
   },
   "dependencies": {
     "express": "^4.18.2",
-    "express-rate-limit": "^7.3.1",
-    "playwright-chromium": "^1.44.0"
+    "puppeteer": "^22.8.0"
   },
   "engines": { "node": ">=18" }
 }

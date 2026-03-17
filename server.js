@@ -1,8 +1,17 @@
-const express   = require('express');
-const puppeteer = require('puppeteer');
+const express = require('express');
+const fetch   = require('node-fetch');
+const cheerio = require('cheerio');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
+
+const HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+    + 'AppleWebKit/537.36 (KHTML, like Gecko) '
+    + 'Chrome/120.0.0.0 Safari/537.36',
+  'Referer': 'https://vidsrc.me/',
+  'Origin':  'https://vidsrc.me',
+};
 
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -15,82 +24,75 @@ app.get('/sources', async (req, res) => {
   const { imdb, season, episode } = req.query;
   if (!imdb) return res.status(400).json({ error: 'imdb required' });
 
-  const embedUrl = season
-    ? `https://vidsrc.me/embed/tv?imdb=${imdb}&season=${season}&episode=${episode}`
-    : `https://vidsrc.me/embed/movie?imdb=${imdb}`;
-
-  console.log(`[proxy] Visiting: ${embedUrl}`);
-
-  let browser;
-  const sources   = [];
-  const subtitles = [];
-
   try {
-    browser = await puppeteer.launch({
-      headless: 'new',
-      executablePath:
-        process.env.CHROME_BIN ||
-        '/usr/bin/google-chrome-stable' ||
-        '/usr/bin/chromium-browser' ||
-        '/usr/bin/chromium',
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--no-zygote',
-        '--single-process',
-      ],
-    });
+    // Step 1: Load the embed page HTML
+    const embedUrl = season
+      ? `https://vidsrc.me/embed/tv?imdb=${imdb}&season=${season}&episode=${episode}`
+      : `https://vidsrc.me/embed/movie?imdb=${imdb}`;
 
-    const page = await browser.newPage();
+    console.log(`[proxy] Fetching embed: ${embedUrl}`);
+    const embedRes = await fetch(embedUrl, { headers: HEADERS });
+    const html     = await embedRes.text();
+    const $        = cheerio.load(html);
 
-    await page.setUserAgent(
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-      '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    );
+    // Step 2: Find the source data-id from the embed page
+    // VidSrc stores the media id in a script tag or data attribute
+    const sources = [];
 
-    await page.setRequestInterception(true);
+    // Extract any script that contains a source/stream URL pattern
+    $('script').each((_, el) => {
+      const text = $(el).html() || '';
 
-    page.on('request', interceptedReq => {
-      const url = interceptedReq.url();
-
-      if (url.includes('.m3u8')) {
-        const hdrs = interceptedReq.headers();
-        if (!sources.find(s => s.url === url)) {
-          sources.push({
-            url,
-            quality:  'auto',
-            mimeType: 'application/x-mpegURL',
-            headers: {
-              'Referer':    hdrs['referer']    || 'https://vidsrc.me/',
-              'User-Agent': hdrs['user-agent'] || '',
-            },
-            subtitles,
-          });
-        }
+      // Look for .m3u8 URLs embedded in the script
+      const m3u8Matches = text.match(
+        /https?:\/\/[^\s'"]+\.m3u8[^\s'"]*/g
+      );
+      if (m3u8Matches) {
+        m3u8Matches.forEach(url => {
+          if (!sources.find(s => s.url === url)) {
+            sources.push({
+              url,
+              quality:  'auto',
+              mimeType: 'application/x-mpegURL',
+              headers:  { 'Referer': 'https://vidsrc.me/' },
+              subtitles: [],
+            });
+          }
+        });
       }
+    });
 
-      if (url.includes('.vtt')) {
-        if (!subtitles.find(s => s.url === url)) {
-          subtitles.push({
-            url,
-            language: 'en',
-            label: 'Subtitle',
-          });
-        }
+    // Step 3: If no m3u8 found in HTML, try VidSrc's internal API
+    if (sources.length === 0) {
+      console.log('[proxy] No m3u8 in HTML, trying internal API...');
+
+      // Extract the data-id or media hash from the page
+      const dataId = $('[data-id]').first().attr('data-id')
+        || $('script[src*="source"]').first().attr('src');
+
+      if (dataId) {
+        const apiUrl = `https://vidsrc.me/api/source/${dataId}`;
+        console.log(`[proxy] Calling internal API: ${apiUrl}`);
+
+        const apiRes  = await fetch(apiUrl, { headers: HEADERS });
+        const apiData = await apiRes.json();
+
+        // VidSrc internal API returns array of sources
+        const apiSources = apiData?.source || apiData?.sources || [];
+        apiSources.forEach(s => {
+          if (s.file || s.url) {
+            sources.push({
+              url:      s.file || s.url,
+              quality:  s.label || 'auto',
+              mimeType: (s.file || s.url || '').includes('.m3u8')
+                ? 'application/x-mpegURL' : 'video/mp4',
+              headers:  { 'Referer': 'https://vidsrc.me/' },
+              subtitles: [],
+            });
+          }
+        });
       }
-
-      interceptedReq.continue();
-    });
-
-    await page.goto(embedUrl, {
-      waitUntil: 'networkidle2',
-      timeout: 30000,
-    });
-
-    // Wait for JS player to fire the stream request
-    await new Promise(r => setTimeout(r, 7000));
+    }
 
     console.log(`[proxy] Found ${sources.length} source(s)`);
     res.json({ sources });
@@ -98,8 +100,6 @@ app.get('/sources', async (req, res) => {
   } catch (err) {
     console.error('[proxy] Error:', err.message);
     res.status(500).json({ error: err.message });
-  } finally {
-    if (browser) await browser.close();
   }
 });
 
@@ -108,7 +108,7 @@ if (process.env.RENDER_EXTERNAL_URL) {
   setInterval(() => {
     require('https').get(
       process.env.RENDER_EXTERNAL_URL + '/health',
-      () => console.log('[keepalive] pinged self')
+      () => {}
     );
   }, 840000);
 }

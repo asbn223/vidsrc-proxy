@@ -8,7 +8,7 @@ const PORT = process.env.PORT || 3000;
 const limiter = rateLimit({
   windowMs: 60 * 1000,
   max: 20,
-  message: { error: "Too many requests, slow down." }
+  message: { error: "Too many requests, slow down." },
 });
 app.use(limiter);
 
@@ -20,52 +20,100 @@ app.use((req, res, next) => {
 
 app.get("/health", (_, res) => res.json({ ok: true }));
 
-// ─── helpers ──────────────────────────────────────────────────────────────────
+// ─── Embed providers (tried in order until one yields sources) ────────────────
+function getProviders(imdb, season, episode) {
+  const ep = episode || "1";
+  const isTV = !!season;
 
-function classifyUrl(url, ct) {
-  const u = url.toLowerCase();
-  const c = ct.toLowerCase();
-  return {
-    isHLS:  u.includes(".m3u8") || c.includes("mpegurl"),
-    isMp4:  u.includes(".mp4")  || c.includes("video/mp4"),
-    isDash: u.includes(".mpd")  || c.includes("dash+xml"),
-    isVtt:  u.includes(".vtt")  || c.includes("text/vtt"),
-  };
+  return [
+    // 1. vidsrc.to
+    {
+      name: "vidsrc.to",
+      url: isTV
+        ? `https://vidsrc.to/embed/tv/${imdb}/${season}/${ep}`
+        : `https://vidsrc.to/embed/movie/${imdb}`,
+    },
+    // 2. vidsrc.xyz
+    {
+      name: "vidsrc.xyz",
+      url: isTV
+        ? `https://vidsrc.xyz/embed/tv?imdb=${imdb}&season=${season}&episode=${ep}`
+        : `https://vidsrc.xyz/embed/movie?imdb=${imdb}`,
+    },
+    // 3. 2embed.cc
+    {
+      name: "2embed.cc",
+      url: isTV
+        ? `https://www.2embed.cc/embedtv/${imdb}&s=${season}&e=${ep}`
+        : `https://www.2embed.cc/embed/${imdb}`,
+    },
+    // 4. autoembed.cc
+    {
+      name: "autoembed.cc",
+      url: isTV
+        ? `https://player.autoembed.cc/embed/tv/${imdb}/${season}/${ep}`
+        : `https://player.autoembed.cc/embed/movie/${imdb}`,
+    },
+    // 5. vidsrcme.ru (last resort — most obfuscated)
+    {
+      name: "vidsrcme.ru",
+      url: isTV
+        ? `https://vidsrcme.ru/embed/tv?imdb=${imdb}&season=${season}&episode=${ep}`
+        : `https://vidsrcme.ru/embed/movie?imdb=${imdb}`,
+    },
+  ];
 }
 
-async function tryClick(page) {
-  // Try a cascade of likely play-button selectors
+// ─── Stream classifier ────────────────────────────────────────────────────────
+function isStream(url, ct) {
+  const u = url.toLowerCase();
+  const c = (ct || "").toLowerCase();
+  return (
+    u.includes(".m3u8") || c.includes("mpegurl") ||
+    u.includes(".mp4")  || c.includes("video/mp4") ||
+    u.includes(".mpd")  || c.includes("dash+xml")
+  );
+}
+function getMimeType(url, ct) {
+  const u = url.toLowerCase();
+  const c = (ct || "").toLowerCase();
+  if (u.includes(".m3u8") || c.includes("mpegurl")) return "application/x-mpegURL";
+  if (u.includes(".mp4")  || c.includes("video/mp4")) return "video/mp4";
+  return "application/dash+xml";
+}
+
+// ─── Click every likely play button in a frame ───────────────────────────────
+async function clickPlay(frame) {
   const selectors = [
-    "video",
-    ".play-btn", ".play-button", "#play-btn", "#play-button",
-    "[class*='play']", "[id*='play']",
+    ".jw-icon-display",
+    ".vjs-big-play-button",
+    ".plyr__control--overlaid",
+    ".fp-play",
+    "[class*='play']",
     "button",
-    ".jw-icon-display",        // JW Player
-    ".plyr__control--overlaid", // Plyr
-    ".vjs-big-play-button",    // Video.js
-    ".fp-play",                // Flowplayer
+    "video",
+    "body",
   ];
   for (const sel of selectors) {
-    try { await page.click(sel, { timeout: 1500 }); } catch (_) {}
+    try { await frame.click(sel, { timeout: 1000, force: true }); break; } catch (_) {}
   }
 }
 
-// ─── core extractor ───────────────────────────────────────────────────────────
-
-async function extractStreams(embedUrl) {
+// ─── Core extractor for one provider URL ─────────────────────────────────────
+async function extractFromProvider(providerName, embedUrl) {
   const sources   = [];
   const subtitles = [];
   const allUrls   = [];
 
+  console.log(`\n[${providerName}] Trying: ${embedUrl}`);
+
   const browser = await chromium.launch({
     headless: true,
     args: [
-      "--disable-gpu",
-      "--single-process",
-      "--no-zygote",
-      "--no-sandbox",
+      "--disable-gpu", "--no-sandbox",
       "--disable-setuid-sandbox",
-    ]
+      "--single-process", "--no-zygote",
+    ],
   });
 
   try {
@@ -75,11 +123,10 @@ async function extractStreams(embedUrl) {
         "AppleWebKit/537.36 (KHTML, like Gecko) " +
         "Chrome/124.0.0.0 Safari/537.36",
       ignoreHTTPSErrors: true,
-      // Pretend we have a real viewport so players don't hide
       viewport: { width: 1280, height: 720 },
     });
 
-    // ── response listener (fires for ALL pages / iframes in this context) ──
+    // Capture ALL network responses across every frame in this context
     ctx.on("response", response => {
       const url = response.url();
       const ct  = response.headers()["content-type"] || "";
@@ -87,150 +134,119 @@ async function extractStreams(embedUrl) {
 
       allUrls.push({ url, contentType: ct });
 
-      const { isHLS, isMp4, isDash, isVtt } = classifyUrl(url, ct);
-
-      if ((isHLS || isMp4 || isDash) && !sources.find(s => s.url === url)) {
+      if (isStream(url, ct) && !sources.find(s => s.url === url)) {
         sources.push({
           url,
           quality: "auto",
-          mimeType: isHLS ? "application/x-mpegURL"
-                  : isMp4 ? "video/mp4"
-                  :          "application/dash+xml",
+          mimeType: getMimeType(url, ct),
           headers: { Referer: ref || embedUrl },
         });
-        console.log("[proxy] ✅ Stream:", url);
+        console.log(`[${providerName}] Stream found:`, url);
       }
 
+      const isVtt = url.includes(".vtt") || ct.includes("text/vtt");
       if (isVtt && !subtitles.find(s => s.url === url)) {
-        const lang = url.includes("english") || url.includes("en.") ? "en" : "un";
+        const lang = /english|[._-]en[._-]/.test(url) ? "en" : "un";
         subtitles.push({ url, language: lang, label: "Subtitle" });
       }
     });
 
-    // ── block heavy resources we don't need ──
+    // Block things that can't contain stream URLs
     await ctx.route("**/*", async route => {
       const rt = route.request().resourceType();
-      // Keep scripts & XHR — they load the player and stream URLs
-      if (["image", "font", "stylesheet", "media"].includes(rt))
-        return route.abort();
+      if (["image", "font", "stylesheet"].includes(rt)) return route.abort();
       await route.continue();
     });
 
-    // ── Step 1: load the top-level embed page ──
     const page = await ctx.newPage();
-    console.log("[proxy] Loading embed:", embedUrl);
-    await page.goto(embedUrl, { timeout: 45000, waitUntil: "networkidle" });
+    await page.goto(embedUrl, { timeout: 45000, waitUntil: "domcontentloaded" });
 
-    // Short pause to let JS settle
-    await page.waitForTimeout(3000);
+    // Three rounds: wait → click all frames → check for sources
+    for (let round = 0; round < 3; round++) {
+      await page.waitForTimeout(4000);
 
-    // ── Step 2: collect iframe srcs before clicking anything ──
-    const iframeSrcs = await page
-      .$$eval("iframe", frames =>
-        frames
-          .map(f => f.src || f.getAttribute("src"))
-          .filter(s => s && s.startsWith("http"))
-      )
-      .catch(() => []);
-
-    console.log("[proxy] Found iframes:", iframeSrcs);
-
-    // ── Step 3: try clicking play on the top page ──
-    await tryClick(page);
-    await page.waitForTimeout(5000);
-
-    // ── Step 4: open every iframe URL in its own page so its JS runs ──
-    for (const src of iframeSrcs) {
-      console.log("[proxy] Opening iframe page:", src);
-      try {
-        const iPage = await ctx.newPage();
-        await iPage.goto(src, { timeout: 30000, waitUntil: "networkidle" });
-        await iPage.waitForTimeout(3000);
-        await tryClick(iPage);
-        await iPage.waitForTimeout(8000);  // wait for HLS manifest to be requested
-        await iPage.close();
-      } catch (e) {
-        console.warn("[proxy] iframe page error:", e.message);
+      // page.frames() gives us the main frame + ALL nested iframes natively
+      for (const frame of page.frames()) {
+        try { await clickPlay(frame); } catch (_) {}
       }
+
+      if (sources.length > 0) break;
     }
 
-    // ── Step 5: if we still have nothing, try the cloudnestra RCP URL directly ──
-    if (sources.length === 0) {
-      const rcpEntry = allUrls.find(u =>
-        u.url.includes("cloudnestra.com/rcp/") && u.contentType.includes("text/html")
-      );
-      if (rcpEntry) {
-        console.log("[proxy] Falling back to RCP page:", rcpEntry.url);
-        try {
-          const rcpPage = await ctx.newPage();
-          await rcpPage.goto(rcpEntry.url, { timeout: 30000, waitUntil: "networkidle" });
-          await rcpPage.waitForTimeout(3000);
-          await tryClick(rcpPage);
-          await rcpPage.waitForTimeout(10000);
-          await rcpPage.close();
-        } catch (e) {
-          console.warn("[proxy] RCP page error:", e.message);
-        }
-      }
-    }
+    if (sources.length === 0) await page.waitForTimeout(6000);
 
-    // Final settle
-    await page.waitForTimeout(2000);
-
-    console.log("[proxy] Done — sources:", sources.length, "subtitles:", subtitles.length);
-    return { sources, subtitles, allUrls };
+    console.log(`[${providerName}] Done — sources: ${sources.length}`);
+    return { sources, subtitles, allUrls, provider: providerName };
 
   } finally {
     await browser.close();
   }
 }
 
-// ─── routes ───────────────────────────────────────────────────────────────────
+// ─── Try all providers until one returns sources ──────────────────────────────
+async function extractStreams(imdb, season, episode) {
+  const providers = getProviders(imdb, season, episode);
 
-function buildEmbedUrl(imdb, season, episode) {
-  if (season) {
-    return (
-      "https://vidsrcme.ru/embed/tv?imdb=" + imdb +
-      "&season=" + season +
-      "&episode=" + (episode || "1")
-    );
+  for (const { name, url } of providers) {
+    try {
+      const result = await extractFromProvider(name, url);
+      if (result.sources.length > 0) return result;
+      console.log(`[proxy] ${name} returned no sources, trying next...`);
+    } catch (err) {
+      console.warn(`[proxy] ${name} threw: ${err.message}, trying next...`);
+    }
   }
-  return "https://vidsrcme.ru/embed/movie?imdb=" + imdb;
+
+  return { sources: [], subtitles: [], allUrls: [], provider: "none" };
 }
 
+// ─── Routes ───────────────────────────────────────────────────────────────────
+
+// GET /sources?imdb=tt1375666
+// GET /sources?imdb=tt1375666&season=1&episode=2
 app.get("/sources", async (req, res) => {
   const { imdb, season, episode } = req.query;
   if (!imdb || typeof imdb !== "string")
     return res.status(400).json({ error: "?imdb=tt... is required" });
 
-  const embedUrl = buildEmbedUrl(imdb, season, episode);
-  console.log("[proxy] /sources ->", embedUrl);
   try {
-    const { sources, subtitles } = await extractStreams(embedUrl);
-    res.json({ sources, subtitles });
+    const { sources, subtitles, provider } = await extractStreams(imdb, season, episode);
+    res.json({ sources, subtitles, provider });
   } catch (err) {
-    console.error("[proxy] Error:", err.message);
+    console.error("[proxy] Fatal:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-// GET /debug?imdb=tt0111161  — see every URL the player touches
+// GET /debug?imdb=tt0111161  — full dump including all captured URLs
 app.get("/debug", async (req, res) => {
   const { imdb, season, episode } = req.query;
   if (!imdb || typeof imdb !== "string")
     return res.status(400).json({ error: "?imdb=tt... is required" });
 
-  const embedUrl = buildEmbedUrl(imdb, season, episode);
-  console.log("[proxy] /debug ->", embedUrl);
   try {
-    const { sources, subtitles, allUrls } = await extractStreams(embedUrl);
-    res.json({ sources, subtitles, allUrls });
+    const result = await extractStreams(imdb, season, episode);
+    res.json(result);
   } catch (err) {
-    console.error("[proxy] Error:", err.message);
+    console.error("[proxy] Fatal:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /try?url=https://vidsrc.to/embed/movie/tt1375666  — test any embed URL directly
+app.get("/try", async (req, res) => {
+  const { url } = req.query;
+  if (!url) return res.status(400).json({ error: "?url=... is required" });
+
+  try {
+    const result = await extractFromProvider("manual", decodeURIComponent(url));
+    res.json(result);
+  } catch (err) {
+    console.error("[proxy] Fatal:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
 app.listen(PORT, () =>
-  console.log("[proxy] Stream extractor running on port " + PORT)
+  console.log(`[proxy] Multi-provider stream extractor on port ${PORT}`)
 );

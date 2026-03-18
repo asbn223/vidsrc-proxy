@@ -4,7 +4,7 @@
   "description": "Headless stream extractor for VidSrc",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
+    "start": "npx playwright install-deps chromium && node server.js",
     "dev": "nodemon server.js"
   },
   "dependencies": {

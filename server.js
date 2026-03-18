@@ -20,93 +20,106 @@ app.use((req, res, next) => {
 
 app.get("/health", (_, res) => res.json({ ok: true }));
 
-app.get("/sources", async (req, res) => {
-  const { imdb, season, episode } = req.query;
-  if (!imdb || typeof imdb !== "string") {
-    return res.status(400).json({ error: "?imdb=tt... is required" });
-  }
-
-  const embedUrl = season
-    ? `https://vidsrcme.ru/embed/tv?imdb=${imdb}&season=${season}&episode=${episode}`
-    : `https://vidsrcme.ru/embed/movie?imdb=${imdb}`;
-
-  console.log(`[proxy] Extracting: ${embedUrl}`);
-
-  let browser;
-  const sources = [];
+async function extractStreams(embedUrl) {
+  const sources   = [];
   const subtitles = [];
+  const allUrls   = [];
+
+  const browser = await chromium.launch({
+    headless: true,
+    args: ["--disable-gpu", "--single-process", "--no-zygote"]
+  });
 
   try {
-    browser = await chromium.launch({
-      headless: true,
-      args: ["--disable-gpu", "--single-process", "--no-zygote"]
-    });
-
     const ctx = await browser.newContext({
-      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+      ignoreHTTPSErrors: true,
     });
 
-    // ✅ context.route() catches requests from ALL frames/iframes, not just the top page
-    await ctx.route("**/*.m3u8**", async route => {
-      const url = route.request().url();
-      const hdrs = route.request().headers();
-      if (!sources.find(s => s.url === url)) {
-        sources.push({
-          url,
-          quality: "auto",
-          mimeType: "application/x-mpegURL",
-          headers: {
-            "Referer": hdrs["referer"] || "https://vidsrc.me/",
-            "User-Agent": hdrs["user-agent"] || "",
-          }
-        });
-        console.log(`[proxy] Captured HLS: ${url}`);
-      }
-      await route.continue();
-    });
-
-    await ctx.route("**/*.vtt**", async route => {
-      const url = route.request().url();
-      if (!subtitles.find(s => s.url === url)) {
-        const lang = url.includes("english") || url.includes("en.") ? "en" : "un";
-        subtitles.push({ url, language: lang, label: "Subtitle" });
-        console.log(`[proxy] Captured VTT: ${url}`);
-      }
-      await route.continue();
-    });
-
-    // Also listen to raw network responses as a fallback
     ctx.on("response", async response => {
       const url = response.url();
-      if (
-        (url.includes(".m3u8") || response.headers()["content-type"]?.includes("mpegURL")) &&
-        !sources.find(s => s.url === url)
-      ) {
+      const ct  = response.headers()["content-type"] || "";
+      const ref = response.headers()["referer"] || "";
+
+      allUrls.push({ url, contentType: ct });
+
+      const isHLS  = url.includes(".m3u8") || ct.includes("mpegURL") || ct.includes("x-mpegurl");
+      const isMp4  = url.includes(".mp4")  || ct.includes("video/mp4");
+      const isDash = url.includes(".mpd")  || ct.includes("dash+xml");
+      const isVtt  = url.includes(".vtt")  || ct.includes("text/vtt");
+
+      if ((isHLS || isMp4 || isDash) && !sources.find(s => s.url === url)) {
         sources.push({
           url,
           quality: "auto",
-          mimeType: "application/x-mpegURL",
-          headers: { "Referer": "https://vidsrc.me/" }
+          mimeType: isHLS ? "application/x-mpegURL" : isMp4 ? "video/mp4" : "application/dash+xml",
+          headers: { "Referer": ref || embedUrl }
         });
-        console.log(`[proxy] Captured HLS (response event): ${url}`);
+        console.log("[proxy] Stream: " + url);
       }
+
+      if (isVtt && !subtitles.find(s => s.url === url)) {
+        const lang = url.includes("english") || url.includes("en.") ? "en" : "un";
+        subtitles.push({ url, language: lang, label: "Subtitle" });
+      }
+    });
+
+    await ctx.route("**/*", async route => {
+      const rt = route.request().resourceType();
+      if (["image", "font", "stylesheet"].includes(rt)) return route.abort();
+      await route.continue();
     });
 
     const page = await ctx.newPage();
-    await page.goto(embedUrl, { timeout: 30000, waitUntil: "networkidle" });
-    await page.waitForTimeout(8000);
+    await page.goto(embedUrl, { timeout: 45000, waitUntil: "networkidle" });
+    await page.waitForTimeout(10000);
 
-    console.log(`[proxy] Found ${sources.length} source(s), ${subtitles.length} subtitle(s)`);
+    return { sources, subtitles, allUrls };
+  } finally {
+    await browser.close();
+  }
+}
+
+app.get("/sources", async (req, res) => {
+  const { imdb, season, episode } = req.query;
+  if (!imdb || typeof imdb !== "string")
+    return res.status(400).json({ error: "?imdb=tt... is required" });
+
+  const embedUrl = season
+    ? "https://vidsrcme.ru/embed/tv?imdb=" + imdb + "&season=" + season + "&episode=" + episode
+    : "https://vidsrcme.ru/embed/movie?imdb=" + imdb;
+
+  console.log("[proxy] Extracting: " + embedUrl);
+  try {
+    const { sources, subtitles } = await extractStreams(embedUrl);
     res.json({ sources, subtitles });
-
   } catch (err) {
     console.error("[proxy] Error:", err.message);
     res.status(500).json({ error: err.message });
-  } finally {
-    await browser?.close();
+  }
+});
+
+// Use this to see every URL the page loads — helps diagnose empty sources
+// GET /debug?imdb=tt0111161
+app.get("/debug", async (req, res) => {
+  const { imdb, season, episode } = req.query;
+  if (!imdb || typeof imdb !== "string")
+    return res.status(400).json({ error: "?imdb=tt... is required" });
+
+  const embedUrl = season
+    ? "https://vidsrcme.ru/embed/tv?imdb=" + imdb + "&season=" + season + "&episode=" + episode
+    : "https://vidsrcme.ru/embed/movie?imdb=" + imdb;
+
+  console.log("[proxy] Debug: " + embedUrl);
+  try {
+    const { sources, subtitles, allUrls } = await extractStreams(embedUrl);
+    res.json({ sources, subtitles, allUrls });
+  } catch (err) {
+    console.error("[proxy] Error:", err.message);
+    res.status(500).json({ error: err.message });
   }
 });
 
 app.listen(PORT, () =>
-  console.log(`[proxy] Stream extractor running on port ${PORT}`)
+  console.log("[proxy] Stream extractor running on port " + PORT)
 );

@@ -63,7 +63,6 @@ app.get("/sources", async (req, res) => {
                         "User-Agent": hdrs["user-agent"] || "",
                     },
                 });
-                subtitles,
                 await route.continue();
             }
         });
